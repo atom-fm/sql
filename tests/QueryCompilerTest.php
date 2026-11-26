@@ -5,10 +5,13 @@ declare(strict_types=1);
 namespace Atom\Tests\Database\Sql;
 
 use Atom\Database\Sql\Compiler\MySqlCompiler;
+use Atom\Database\Sql\Compiler\PostgresCompiler;
 use Atom\Database\Sql\Compiler\SqliteCompiler;
 use Atom\Database\Sql\Op;
 use Atom\Database\Sql\Query;
+use PHPUnit\Framework\Attributes\TestWith;
 use PHPUnit\Framework\TestCase;
+use RuntimeException;
 
 final class QueryCompilerTest extends TestCase
 {
@@ -50,6 +53,45 @@ final class QueryCompilerTest extends TestCase
             $command->sql
         );
         $this->assertSame([":p1" => "active", ":p2" => 1, ":p3" => 2, ":p4" => 3], $command->parameters);
+    }
+
+    public function testEmptyInListCompilesToFalseAcrossDialects(): void
+    {
+        foreach ([new SqliteCompiler(), new MySqlCompiler(), new PostgresCompiler()] as $compiler) {
+            $table = $compiler instanceof MySqlCompiler ? '`users`' : '"users"';
+            foreach ([[], Op::in([])] as $emptyList) {
+                $command = $compiler->compile(Query::select("users")->where("id", $emptyList));
+
+                self::assertSame("SELECT * FROM {$table} WHERE 1 = 0", $command->sql);
+                self::assertSame([], $command->parameters);
+            }
+        }
+    }
+
+    #[TestWith([SqliteCompiler::class], "SQLite")]
+    #[TestWith([MySqlCompiler::class], "MySQL")]
+    public function testRejectsIlikeOutsidePostgres(string $compilerClass): void
+    {
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage("ILIKE is only supported by the PostgreSQL compiler.");
+
+        (new $compilerClass())->compile(Query::select("users")->where("name", Op::ilike("ada%")));
+    }
+
+    public function testPostgresCompilesIlikeWithABoundValue(): void
+    {
+        $command = (new PostgresCompiler())->compile(Query::select("users")->where("name", Op::ilike("ada%")));
+
+        self::assertSame('SELECT * FROM "users" WHERE "name" ILIKE :p1', $command->sql);
+        self::assertSame([":p1" => "ada%"], $command->parameters);
+    }
+
+    public function testSqliteRejectsDeleteLimit(): void
+    {
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage("The SQLite compiler does not support DELETE LIMIT.");
+
+        (new SqliteCompiler())->compile(Query::delete("users")->where("id", 1)->limit(1));
     }
 
     public function testCompilesOffsetWithoutLimitForSqliteAndMySql(): void
@@ -193,6 +235,22 @@ final class QueryCompilerTest extends TestCase
             $command->sql
         );
         $this->assertSame([":id" => 2], $command->parameters);
+    }
+
+    public function testFragmentsCanReusePlaceholderNames(): void
+    {
+        $query = Query::select("users")
+            ->whereExp("id > :bound", ["bound" => 10])
+            ->whereExp("id < :bound AND marker != ':bound'", [":bound" => 20])
+            ->whereExp("id != :p1", ["p1" => 15]);
+
+        $command = (new SqliteCompiler())->compile($query);
+
+        self::assertSame(
+            'SELECT * FROM "users" WHERE "id" > :bound AND "id" < :p2 AND "marker" != \':bound\' AND "id" != :p1',
+            $command->sql
+        );
+        self::assertSame([":bound" => 10, ":p2" => 20, ":p1" => 15], $command->parameters);
     }
 
     public function testGeneratedBindingBeforeCallerBindingPreservesBothValues(): void

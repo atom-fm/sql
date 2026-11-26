@@ -110,6 +110,10 @@ abstract class AbstractSqlCompiler implements QueryCompilerInterface
 
         $values = $query->getValues();
         if ($values === []) {
+            if ($query->usesDefaultValues()) {
+                return new Command("INSERT INTO " . $this->compileTable($table) . $this->defaultValuesClause());
+            }
+
             throw new RuntimeException("Insert query must define values.");
         }
 
@@ -119,6 +123,11 @@ abstract class AbstractSqlCompiler implements QueryCompilerInterface
         $sql .= " VALUES (" . implode(", ", array_map(fn(mixed $value) => $this->bind($value), $values)) . ")";
 
         return new Command($sql, $this->parameters);
+    }
+
+    protected function defaultValuesClause(): string
+    {
+        return " DEFAULT VALUES";
     }
 
     protected function compileUpsert(UpsertQuery $query): Command
@@ -219,8 +228,8 @@ abstract class AbstractSqlCompiler implements QueryCompilerInterface
 
     protected function compileSelectExpression(SelectExpression $expression): string
     {
-        $this->bindNamedParameters($expression->parameters);
         $sql = $expression->aggregate ? $this->compileAggregateExpression($expression->expression) : $expression->expression;
+        $sql = $this->bindFragment($sql, $expression->parameters);
         return $expression->alias === null ? $sql : $sql . " " . $this->quoteIdentifier($expression->alias);
     }
 
@@ -307,10 +316,11 @@ abstract class AbstractSqlCompiler implements QueryCompilerInterface
 
         return match ($op->operator) {
             "IS NULL", "IS NOT NULL" => "{$column} {$op->operator}",
-            "IN" => "{$column} IN " . $this->compileValueList($op->value),
+            "IN" => $op->value === [] ? "1 = 0" : "{$column} IN " . $this->compileValueList($op->value),
             "BETWEEN" => "{$column} BETWEEN {$this->bind($op->value)} AND {$this->bind($op->maxValue)}",
             "LIKE" => "{$column} LIKE {$this->bind($op->value)}" .
                 ($op->escape === null ? "" : " ESCAPE {$this->bind($op->escape)}"),
+            "ILIKE" => $this->compileIlike($column, $op->value),
             "=" => "{$column} = " . ($op->value instanceof Column ? $this->compileColumn($op->value) : $this->bind($op->value)),
             "<>", ">=", "<=", ">", "<" => "{$column} {$op->operator} " .
                 ($op->value instanceof Column ? $this->compileColumn($op->value) : $this->bind($op->value)),
@@ -318,23 +328,38 @@ abstract class AbstractSqlCompiler implements QueryCompilerInterface
         };
     }
 
+    protected function compileIlike(string $column, mixed $value): string
+    {
+        throw new RuntimeException("ILIKE is only supported by the PostgreSQL compiler.");
+    }
+
     protected function compileCriteriaExpression(CriteriaExpression $expression): string
     {
-        $this->bindNamedParameters($expression->parameters);
-        return $this->quoteExpression($expression->expression);
+        return $this->quoteExpression($this->bindFragment($expression->expression, $expression->parameters));
     }
 
     /** @param array<string, mixed> $parameters */
-    private function bindNamedParameters(array $parameters): void
+    private function bindFragment(string $sql, array $parameters): string
     {
+        $bindings = [];
         foreach ($parameters as $name => $value) {
-            $parameterName = str_starts_with((string) $name, ":") ? (string) $name : ":" . $name;
-            if (!isset($this->callerParameterNames[$parameterName]) && array_key_exists($parameterName, $this->parameters)) {
+            $bindings[":" . ltrim((string) $name, ":")] = $value;
+        }
+
+        $renamed = [];
+        foreach ($bindings as $name => $value) {
+            if (array_key_exists($name, $this->parameters)) {
+                if (isset($this->callerParameterNames[$name])) {
+                    $renamed[$name] = $this->bind($value);
+                    continue;
+                }
                 $this->hasBindingCollision = true;
             }
-            $this->callerParameterNames[$parameterName] = true;
-            $this->parameters[$parameterName] = $value;
+            $this->callerParameterNames[$name] = true;
+            $this->parameters[$name] = $value;
         }
+
+        return $renamed === [] ? $sql : Command::renamePlaceholders($sql, $renamed);
     }
 
     /**
@@ -352,8 +377,8 @@ abstract class AbstractSqlCompiler implements QueryCompilerInterface
     {
         $parts = [];
         foreach ($sorts as $sort) {
-            $this->bindNamedParameters($sort->parameters);
             $column = $sort->column instanceof Column ? $this->compileColumn($sort->column) : $sort->column;
+            $column = $this->bindFragment($column, $sort->parameters);
             $parts[] = $column . " " . $sort->direction;
         }
         return implode(", ", $parts);
